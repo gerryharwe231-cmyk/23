@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "slopeconnector_arc_hotfix",
+  "version": "${version}",
+  "name": "Slope Connector Visible UV Safety Fix",
+  "description": "Fixes invisible arc and trim meshes caused by an invalid baked-quad UV affine constant, with sprite-bound safety fallback.",
+  "authors": ["OpenAI"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.slopeconnector.hotfix.ArcHotfixMod"],
+    "client": ["com.slopeconnector.hotfix.client.ArcHotfixClient"]
+  },
+  "mixins": ["slopeconnector_arc_hotfix.mixins.json"],
+  "jars": [{"file": "META-INF/jars/slopeconnector-0.9.10.jar"}],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "fabric-api": "*",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "slopeconnector": "=0.9.10-endpoint-symmetry-fix"
+  }
+}
