@@ -47,22 +47,36 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE_ARCHIVE="$RUNNER_TEMP/slope_connector_realmesh_0.9.18_connected_model_sweep_FLAT_GITHUB.zip"
-          python3 - "${{ steps.locate.outputs.project_dir }}" "$SOURCE_ARCHIVE" <<'PY'
+          python3 - "${{ steps.locate.outputs.project_dir }}" "$GITHUB_WORKSPACE" "$SOURCE_ARCHIVE" <<'PY'
           from pathlib import Path
           from zipfile import ZIP_DEFLATED, ZipFile
           import sys
 
-          root = Path(sys.argv[1]).resolve()
-          output = Path(sys.argv[2]).resolve()
+          project = Path(sys.argv[1]).resolve()
+          repository = Path(sys.argv[2]).resolve()
+          output = Path(sys.argv[3]).resolve()
           excluded = {'.git', '.gradle', 'build'}
-          with ZipFile(output, 'w', ZIP_DEFLATED) as archive:
+          written = set()
+
+          def add_tree(archive, root, archive_root=None):
               for path in sorted(root.rglob('*')):
                   if not path.is_file():
                       continue
                   relative = path.relative_to(root)
                   if any(part in excluded for part in relative.parts):
                       continue
-                  archive.write(path, relative.as_posix())
+                  target = relative if archive_root is None else archive_root / relative
+                  name = target.as_posix()
+                  if name in written:
+                      continue
+                  archive.write(path, name)
+                  written.add(name)
+
+          with ZipFile(output, 'w', ZIP_DEFLATED) as archive:
+              add_tree(archive, project)
+              workflow_root = repository / '.github'
+              if workflow_root.is_dir() and not (project / '.github').is_dir():
+                  add_tree(archive, workflow_root, Path('.github'))
           PY
           echo "archive=$SOURCE_ARCHIVE" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
