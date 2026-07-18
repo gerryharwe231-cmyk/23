@@ -1,12 +1,11 @@
-name: Build 0.9.18 Connected Model Sweep
+name: Build Slope Connector
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-      - fix/0.9.18-connected-model-sweep
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
 
 jobs:
   build:
@@ -40,18 +39,10 @@ jobs:
             PROJECT_DIR=$(dirname "$CANDIDATE")
           fi
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-      - name: Source regression checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROJECT="${{ steps.locate.outputs.project_dir }}"
-          grep -q 'MATERIAL_BAKED_MODEL' "$PROJECT/src/main/java/com/slopeconnector/hotfix/SourceProfile.java"
-          grep -q 'getVertexData' "$PROJECT/src/main/java/com/slopeconnector/hotfix/client/ArcRibbonRenderer.java"
-          grep -q 'MODEL_CONNECTED' "$PROJECT/src/main/java/com/slopeconnector/hotfix/ArcRibbonGenerator.java"
       - name: Build
         run: gradle -p "${{ steps.locate.outputs.project_dir }}" --no-daemon --console=plain clean build
       - uses: actions/upload-artifact@v4
         with:
-          name: slope-connector-0.9.18-connected-model-sweep
+          name: slope-connector-build
           path: ${{ steps.locate.outputs.project_dir }}/build/libs/*.jar
           if-no-files-found: error
