@@ -41,8 +41,37 @@ jobs:
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
       - name: Build
         run: gradle -p "${{ steps.locate.outputs.project_dir }}" --no-daemon --console=plain clean build
+      - name: Package complete source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_ARCHIVE="$RUNNER_TEMP/slope_connector_realmesh_0.9.18_connected_model_sweep_FLAT_GITHUB.zip"
+          python3 - "${{ steps.locate.outputs.project_dir }}" "$SOURCE_ARCHIVE" <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          import sys
+
+          root = Path(sys.argv[1]).resolve()
+          output = Path(sys.argv[2]).resolve()
+          excluded = {'.git', '.gradle', 'build'}
+          with ZipFile(output, 'w', ZIP_DEFLATED) as archive:
+              for path in sorted(root.rglob('*')):
+                  if not path.is_file():
+                      continue
+                  relative = path.relative_to(root)
+                  if any(part in excluded for part in relative.parts):
+                      continue
+                  archive.write(path, relative.as_posix())
+          PY
+          echo "archive=$SOURCE_ARCHIVE" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: slope-connector-build
           path: ${{ steps.locate.outputs.project_dir }}/build/libs/*.jar
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slope-connector-0.9.18-complete-source
+          path: ${{ steps.source.outputs.archive }}
           if-no-files-found: error
