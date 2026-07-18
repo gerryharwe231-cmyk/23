@@ -9,6 +9,7 @@ import net.minecraft.state.property.Property;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.World;
@@ -83,6 +84,30 @@ public final class SourceProfile {
         return mode == MODEL_CONNECTED ? canonicalConnectedState(original) : original;
     }
 
+    /**
+     * Turns a real endpoint block into the one-sided state that points toward the first/last arc
+     * cell. The endpoint itself stays a normal world block, so it can still be broken separately.
+     */
+    public static BlockState endpointConnectedState(BlockState original, Direction towardArc) {
+        if (towardArc == null || towardArc.getAxis().isVertical()) return original;
+        String target = towardArc.getName().toLowerCase(Locale.ROOT);
+        for (Property<?> property : original.getProperties()) {
+            String name = property.getName().toLowerCase(Locale.ROOT);
+            String value = switch (name) {
+                case "north", "south", "east", "west" -> name.equals(target) ? "true" : "false";
+                case "north_wall_shape", "south_wall_shape", "east_wall_shape", "west_wall_shape" ->
+                        name.startsWith(target) ? "low" : "none";
+                case "axis", "horizontal_axis" ->
+                        towardArc.getAxis() == Direction.Axis.X ? "x" : "z";
+                case "horizontal_facing", "facing" -> target;
+                case "up" -> original.getBlock() instanceof WallBlock ? "true" : null;
+                default -> null;
+            };
+            if (value != null) original = setSerializedValue(original, property, value);
+        }
+        return original;
+    }
+
     private static boolean isConnectedModelCandidate(BlockState state) {
         if (state.getBlock() instanceof FenceBlock
                 || state.getBlock() instanceof PaneBlock
@@ -98,14 +123,17 @@ public final class SourceProfile {
             if (name.equals("axis") || name.equals("horizontal_axis")) axis = true;
             if (name.equals("horizontal_facing")) facing = true;
         }
-        if (horizontalConnections >= 2 || axis || facing) return true;
 
         Identifier id = Registries.BLOCK.getId(state.getBlock());
         String path = id == null ? "" : id.getPath().toLowerCase(Locale.ROOT);
-        return path.contains("railing") || path.contains("balustrade")
+        boolean nameHint = path.contains("railing") || path.contains("balustrade")
                 || path.contains("fence") || path.contains("iron_bars")
                 || path.contains("bars_pane") || path.endsWith("_pane")
                 || path.contains("parapet");
+
+        // Four-way connection properties are strong evidence on their own. Axis/facing alone is
+        // not: logs, pillars and stairs also expose those properties and must remain normal models.
+        return horizontalConnections >= 2 || (nameHint && (axis || facing)) || nameHint;
     }
 
     private static List<Part> canonicalCollisionParts(World world, BlockPos pos, BlockState state) {
