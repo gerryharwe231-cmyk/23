@@ -1,12 +1,12 @@
 package com.slopeconnector.hotfix;
 
 import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
 import net.minecraft.block.FenceBlock;
 import net.minecraft.block.PaneBlock;
 import net.minecraft.block.WallBlock;
-import net.minecraft.block.enums.WallShape;
-import net.minecraft.state.property.Properties;
+import net.minecraft.registry.Registries;
+import net.minecraft.state.property.Property;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
@@ -14,9 +14,11 @@ import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.World;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 
-/** Source-block geometry in the moving path frame: S=tangent, W=width, N=normal. */
+/** Source geometry in the moving path frame: S=tangent, W=width, N=normal. */
 public final class SourceProfile {
     public static final byte MATERIAL_GENERAL = 0;
     public static final byte MATERIAL_RAIL = 1;
@@ -24,6 +26,16 @@ public final class SourceProfile {
     public static final byte MATERIAL_PANE = 3;
     public static final byte MATERIAL_WALL = 4;
     public static final byte MATERIAL_FULL = 5;
+    /** The renderer bends the original baked model and uses its original UVs. */
+    public static final byte MATERIAL_BAKED_MODEL = 6;
+    /** Collision-only prism; the renderer must not draw it. */
+    public static final byte MATERIAL_COLLISION = 7;
+
+    public static final byte MODEL_NONE = 0;
+    /** Keep the source state and source-world orientation. Used by full blocks. */
+    public static final byte MODEL_EXACT = 1;
+    /** Use a canonical east-west connected state. Used by railings/fences/panes/walls. */
+    public static final byte MODEL_CONNECTED = 2;
 
     record Part(double minS, double maxS,
                 double minW, double maxW,
@@ -34,65 +46,98 @@ public final class SourceProfile {
     final List<Part> parts;
     final boolean fullLike;
     final double connectionReach;
+    final byte modelMode;
 
-    private SourceProfile(List<Part> parts, boolean fullLike, double connectionReach) {
+    private SourceProfile(List<Part> parts, boolean fullLike,
+                          double connectionReach, byte modelMode) {
         this.parts = List.copyOf(parts);
         this.fullLike = fullLike;
         this.connectionReach = connectionReach;
+        this.modelMode = modelMode;
     }
+
+    boolean usesBakedModel() { return modelMode != MODEL_NONE; }
 
     static SourceProfile from(World world, BlockPos pos, BlockState state,
                               Vec3d pathDirection, Vec3d widthAxis, Vec3d normalAxis) {
         if (state.isFullCube(world, pos)) {
-            return new SourceProfile(List.of(
-                    new Part(-0.5, 0.5, -0.5, 0.5, -0.5, 0.5,
-                            true, MATERIAL_FULL)
-            ), true, 0.5);
+            // A real baked cube gives exact source UVs and removes the blurred affine remapping.
+            return new SourceProfile(List.of(), true, 0.5, MODEL_EXACT);
         }
 
-        // Pane textures contain their visible rods/openings in alpha, so their real connected visual
-        // is one thin continuous sheet. Separate solid rods destroy the horizontal connectors.
-        if (state.isOf(Blocks.IRON_BARS)) return paneProfile(widthAxis, normalAxis);
-        if (state.getBlock() instanceof PaneBlock) return paneProfile(widthAxis, normalAxis);
-
-        // Read the source block's connected outline rather than replacing every railing with a hard-
-        // coded vanilla fence. This preserves modded balusters, beams and wall profiles when their
-        // block class/properties expose those shapes.
-        if (state.getBlock() instanceof FenceBlock) {
-            return connectedOutlineProfile(world, pos, state, pathDirection, widthAxis, normalAxis,
-                    MATERIAL_RAIL, MATERIAL_POST, 0.125);
-        }
-        if (state.getBlock() instanceof WallBlock) {
-            return connectedOutlineProfile(world, pos, state, pathDirection, widthAxis, normalAxis,
-                    MATERIAL_WALL, MATERIAL_POST, 0.25);
-        }
-        if (hasHorizontalConnections(state)) {
-            return connectedOutlineProfile(world, pos, state, pathDirection, widthAxis, normalAxis,
-                    MATERIAL_GENERAL, MATERIAL_GENERAL, 0.125);
+        if (isConnectedModelCandidate(state)) {
+            // Visuals come from the exact connected baked model. The outline is retained only for
+            // collision, so a railing remains a railing rather than a solid one-block wall.
+            BlockState connected = canonicalConnectedState(state);
+            List<Part> collision = canonicalCollisionParts(world, pos, connected);
+            return new SourceProfile(collision, false, 0.5, MODEL_CONNECTED);
         }
 
+        // Non-connected custom shapes keep the older outline sweep as a safe fallback.
         return outlineProfile(world, pos, state, pathDirection, widthAxis, normalAxis,
                 MATERIAL_GENERAL, MATERIAL_GENERAL, 0.5);
     }
 
-    private static SourceProfile connectedOutlineProfile(World world, BlockPos pos, BlockState original,
-                                                         Vec3d pathDirection, Vec3d widthAxis, Vec3d normalAxis,
-                                                         byte continuousHint, byte repeatedHint,
-                                                         double defaultReach) {
-        BlockState connected = straightConnectedState(original, pathDirection);
-        SourceProfile profile = outlineProfile(world, pos, connected, pathDirection, widthAxis, normalAxis,
-                continuousHint, repeatedHint, defaultReach);
-        if (!profile.parts.isEmpty()) return profile;
-        return outlineProfile(world, pos, original, pathDirection, widthAxis, normalAxis,
-                continuousHint, repeatedHint, defaultReach);
+    /** Client and server use the same canonical state selection. */
+    public static BlockState canonicalModelState(BlockState original, byte mode) {
+        return mode == MODEL_CONNECTED ? canonicalConnectedState(original) : original;
+    }
+
+    private static boolean isConnectedModelCandidate(BlockState state) {
+        if (state.getBlock() instanceof FenceBlock
+                || state.getBlock() instanceof PaneBlock
+                || state.getBlock() instanceof WallBlock) return true;
+
+        int horizontalConnections = 0;
+        boolean axis = false;
+        boolean facing = false;
+        for (Property<?> property : state.getProperties()) {
+            String name = property.getName().toLowerCase(Locale.ROOT);
+            if (name.equals("north") || name.equals("south")
+                    || name.equals("east") || name.equals("west")) horizontalConnections++;
+            if (name.equals("axis") || name.equals("horizontal_axis")) axis = true;
+            if (name.equals("horizontal_facing")) facing = true;
+        }
+        if (horizontalConnections >= 2 || axis || facing) return true;
+
+        Identifier id = Registries.BLOCK.getId(state.getBlock());
+        String path = id == null ? "" : id.getPath().toLowerCase(Locale.ROOT);
+        return path.contains("railing") || path.contains("balustrade")
+                || path.contains("fence") || path.contains("iron_bars")
+                || path.contains("bars_pane") || path.endsWith("_pane")
+                || path.contains("parapet");
+    }
+
+    private static List<Part> canonicalCollisionParts(World world, BlockPos pos, BlockState state) {
+        VoxelShape shape = state.getOutlineShape(world, pos);
+        List<Box> boxes = shape.isEmpty()
+                ? List.of(new Box(0, 0, 0, 1, 1, 1))
+                : shape.getBoundingBoxes();
+        List<Part> parts = new ArrayList<>();
+        for (Box box : boxes) {
+            double minS = box.minX - 0.5, maxS = box.maxX - 0.5;
+            double minW = box.minZ - 0.5, maxW = box.maxZ - 0.5;
+            double minN = box.minY - 0.5, maxN = box.maxY - 0.5;
+            if (maxS - minS < 1.0E-4 || maxW - minW < 1.0E-4 || maxN - minN < 1.0E-4) continue;
+            boolean continuous = maxS - minS >= 0.72;
+            parts.add(new Part(minS, maxS, minW, maxW, minN, maxN,
+                    continuous, MATERIAL_COLLISION));
+        }
+        if (parts.isEmpty()) {
+            parts.add(new Part(-0.5, 0.5, -0.0625, 0.0625, -0.5, 0.5,
+                    true, MATERIAL_COLLISION));
+        }
+        return parts;
     }
 
     private static SourceProfile outlineProfile(World world, BlockPos pos, BlockState state,
-                                                Vec3d pathDirection, Vec3d widthAxis, Vec3d normalAxis,
-                                                byte continuousHint, byte repeatedHint,
-                                                double defaultReach) {
+                                                 Vec3d pathDirection, Vec3d widthAxis, Vec3d normalAxis,
+                                                 byte continuousHint, byte repeatedHint,
+                                                 double defaultReach) {
         VoxelShape shape = state.getOutlineShape(world, pos);
-        List<Box> boxes = shape.isEmpty() ? List.of(new Box(0, 0, 0, 1, 1, 1)) : shape.getBoundingBoxes();
+        List<Box> boxes = shape.isEmpty()
+                ? List.of(new Box(0, 0, 0, 1, 1, 1))
+                : shape.getBoundingBoxes();
         List<Part> parts = new ArrayList<>();
         double coreReach = 0.0;
         for (Box box : boxes) {
@@ -122,59 +167,49 @@ public final class SourceProfile {
         if (parts.isEmpty()) {
             parts.add(new Part(-0.5, 0.5, -0.5, 0.5, -0.5, 0.5,
                     true, continuousHint));
-            return new SourceProfile(parts, false, 0.5);
+            return new SourceProfile(parts, false, 0.5, MODEL_NONE);
         }
         double reach = coreReach > 1.0E-4 ? coreReach : defaultReach;
-        return new SourceProfile(parts, false, Math.max(0.03125, Math.min(0.5, reach)));
+        return new SourceProfile(parts, false,
+                Math.max(0.03125, Math.min(0.5, reach)), MODEL_NONE);
     }
 
-    private static BlockState straightConnectedState(BlockState state, Vec3d pathDirection) {
-        boolean alongX = Math.abs(pathDirection.x) >= Math.abs(pathDirection.z);
-        try {
-            if (state.contains(Properties.NORTH)) state = state.with(Properties.NORTH, !alongX);
-            if (state.contains(Properties.SOUTH)) state = state.with(Properties.SOUTH, !alongX);
-            if (state.contains(Properties.EAST)) state = state.with(Properties.EAST, alongX);
-            if (state.contains(Properties.WEST)) state = state.with(Properties.WEST, alongX);
-
-            if (state.contains(Properties.NORTH_WALL_SHAPE)) {
-                state = state.with(Properties.NORTH_WALL_SHAPE, alongX ? WallShape.NONE : WallShape.LOW);
-            }
-            if (state.contains(Properties.SOUTH_WALL_SHAPE)) {
-                state = state.with(Properties.SOUTH_WALL_SHAPE, alongX ? WallShape.NONE : WallShape.LOW);
-            }
-            if (state.contains(Properties.EAST_WALL_SHAPE)) {
-                state = state.with(Properties.EAST_WALL_SHAPE, alongX ? WallShape.LOW : WallShape.NONE);
-            }
-            if (state.contains(Properties.WEST_WALL_SHAPE)) {
-                state = state.with(Properties.WEST_WALL_SHAPE, alongX ? WallShape.LOW : WallShape.NONE);
-            }
-            if (state.contains(Properties.UP)) state = state.with(Properties.UP, true);
-        } catch (IllegalArgumentException ignored) {
-            return state;
+    private static BlockState canonicalConnectedState(BlockState state) {
+        for (Property<?> property : state.getProperties()) {
+            String name = property.getName().toLowerCase(Locale.ROOT);
+            String value = switch (name) {
+                case "east", "west" -> "true";
+                case "north", "south" -> "false";
+                case "axis", "horizontal_axis" -> "x";
+                case "horizontal_facing", "facing" -> "east";
+                case "east_wall_shape", "west_wall_shape" -> "low";
+                case "north_wall_shape", "south_wall_shape" -> "none";
+                case "up" -> state.getBlock() instanceof WallBlock ? "true" : null;
+                default -> null;
+            };
+            if (value != null) state = setSerializedValue(state, property, value);
         }
         return state;
     }
 
-    private static boolean hasHorizontalConnections(BlockState state) {
-        return state.contains(Properties.NORTH) && state.contains(Properties.SOUTH)
-                && state.contains(Properties.EAST) && state.contains(Properties.WEST);
-    }
-
-    private static SourceProfile paneProfile(Vec3d widthAxis, Vec3d normalAxis) {
-        boolean verticalIsW = isVertical(widthAxis, normalAxis);
-        if (verticalIsW) {
-            return new SourceProfile(List.of(
-                    new Part(-0.5, 0.5, -0.5, 0.5, -0.0625, 0.0625,
-                            true, MATERIAL_PANE)
-            ), false, 0.0625);
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static BlockState setSerializedValue(BlockState state, Property property, String wanted) {
+        Collection<? extends Comparable> values = property.getValues();
+        for (Comparable value : values) {
+            String serialized;
+            try {
+                serialized = property.name(value);
+            } catch (RuntimeException ignored) {
+                serialized = value.toString();
+            }
+            if (wanted.equalsIgnoreCase(serialized) || wanted.equalsIgnoreCase(value.toString())) {
+                try {
+                    return state.with(property, value);
+                } catch (IllegalArgumentException ignored) {
+                    return state;
+                }
+            }
         }
-        return new SourceProfile(List.of(
-                new Part(-0.5, 0.5, -0.0625, 0.0625, -0.5, 0.5,
-                        true, MATERIAL_PANE)
-        ), false, 0.0625);
-    }
-
-    private static boolean isVertical(Vec3d widthAxis, Vec3d normalAxis) {
-        return Math.abs(widthAxis.y) >= Math.abs(normalAxis.y);
+        return state;
     }
 }
