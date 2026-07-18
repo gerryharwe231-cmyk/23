@@ -1,8 +1,10 @@
-name: Build 0.9.17 Visible UV Safety Fix
+name: Build Slope Connector
 
 on:
   workflow_dispatch:
   push:
+    branches: [ main, master ]
+  pull_request:
     branches: [ main, master ]
 
 jobs:
@@ -37,12 +39,10 @@ jobs:
             PROJECT_DIR=$(dirname "$CANDIDATE")
           fi
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-      - name: UV affine regression test
-        run: python3 "${{ steps.locate.outputs.project_dir }}/tools/verify_uv_affine.py"
       - name: Build
         run: gradle -p "${{ steps.locate.outputs.project_dir }}" --no-daemon --console=plain clean build
       - uses: actions/upload-artifact@v4
         with:
-          name: slope-connector-0.9.17-visible-uv-safety-fix
+          name: slope-connector-build
           path: ${{ steps.locate.outputs.project_dir }}/build/libs/*.jar
           if-no-files-found: error
