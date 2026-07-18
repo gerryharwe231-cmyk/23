@@ -17,10 +17,10 @@ import java.util.Map;
 import java.util.Set;
 
 public final class ArcRibbonGenerator {
-    private static final int MAX_PRISMS = 3072;
+    private static final int MAX_PRISMS = 4096;
+    private static final byte NO_FACES = 0x00;
     private static final byte SIDE_FACES = 0x0F;
     private static final byte ALL_FACES = 0x3F;
-    private static final double ENDPOINT_SKIN_OFFSET = 0.0015;
 
     public record Result(int placed, int materialPicked, int fallbackUsed, int skipped, String error) {
         static Result error(String error) { return new Result(0, 0, 0, 0, error); }
@@ -65,8 +65,10 @@ public final class ArcRibbonGenerator {
         int repeatCount = Math.max(1, (int)Math.round(totalLength));
         double textureScale = repeatCount / totalLength;
 
-        long estimate = (long)(samples.size() - 1) * Math.max(1, profile.parts.size()) * width;
-        if (estimate > MAX_PRISMS) {
+        long modelEstimate = profile.usesBakedModel() ? (long)repeatCount * width : 0L;
+        long collisionEstimate = (long)Math.max(1, samples.size() - 1)
+                * Math.max(1, profile.parts.size()) * width;
+        if (modelEstimate + collisionEstimate > MAX_PRISMS) {
             return Result.error("本次弧线细分过多，已拒绝生成以避免卡顿；请缩短距离或减小宽度");
         }
 
@@ -81,11 +83,20 @@ public final class ArcRibbonGenerator {
                 ? new LinkedHashMap<>() : null;
 
         int prismCount = 0;
-        if (!profile.fullLike && profile.connectionReach < 0.499) {
+        if (profile.usesBakedModel()) {
+            for (int lane = 0; lane < width; lane++) {
+                double laneOffset = lane - (width - 1) * 0.5;
+                prismCount += addModelCells(world, context, samples, totalLength, repeatCount,
+                        laneOffset, profile.fullLike, protectedPos, mesh, worldPrismsByCell);
+            }
+        }
+
+        // Exact connected models use these parts only for collision. Fallback shapes still render
+        // through the legacy prism faces when no baked-model sweep is available.
+        if (!profile.usesBakedModel() && profile.connectionReach < 0.499) {
             prismCount += addEndpointBridges(world, context, samples, profile, startBlock, endBlock,
                     protectedPos, mesh, worldPrismsByCell);
         }
-
         for (int lane = 0; lane < width; lane++) {
             double laneOffset = lane - (width - 1) * 0.5;
             for (SourceProfile.Part part : profile.parts) {
@@ -102,10 +113,15 @@ public final class ArcRibbonGenerator {
             }
         }
 
-        if (profile.fullLike) {
-            // Attach endpoint skins after the arc mesh exists, so they live on the first/last
-            // breakable arc block instead of creating invisible surface-only holder blocks.
-            addEndpointSkins(world, context, samples, startBlock, endBlock, protectedPos, mesh);
+        Vec3d basisS, basisW, basisN;
+        if (profile.modelMode == SourceProfile.MODEL_CONNECTED) {
+            basisS = new Vec3d(1, 0, 0);
+            basisW = new Vec3d(0, 0, 1);
+            basisN = new Vec3d(0, 1, 0);
+        } else {
+            basisS = context.sourcePathDirection;
+            basisW = context.w;
+            basisN = sourceNormal;
         }
 
         int placed = 0, skipped = 0;
@@ -124,7 +140,8 @@ public final class ArcRibbonGenerator {
             BlockEntity blockEntity = world.getBlockEntity(pos);
             if (blockEntity instanceof ArcRibbonBlockEntity ribbon) {
                 MeshCell cell = entry.getValue();
-                ribbon.setData(source, cell.prisms, cell.surfaces);
+                ribbon.setData(source, cell.prisms, cell.surfaces,
+                        profile.modelMode, basisS, basisW, basisN);
                 world.updateListeners(pos, world.getBlockState(pos), world.getBlockState(pos), 3);
                 placed++;
             }
@@ -135,69 +152,26 @@ public final class ArcRibbonGenerator {
         return new Result(placed, trimmed, mesh.size(), skipped, "");
     }
 
-    /** Retextures the five exposed faces of each full-cube endpoint with the exact arc UV frame. */
-    private static void addEndpointSkins(World world, BuildContext context, List<ArcPath.Sample> samples,
-                                         BlockPos startBlock, BlockPos endBlock,
-                                         Set<BlockPos> protectedPos, Map<BlockPos, MeshCell> mesh) {
-        ArcPath.Sample first = samples.get(0), last = samples.get(samples.size() - 1);
-        Frame firstFrame = frame(context, first), lastFrame = frame(context, last);
-        Vec3d startTangent = tangent(context, first);
-        Vec3d endTangent = tangent(context, last);
-        addEndpointSkin(world, startBlock, startTangent, firstFrame.radial, context.w,
-                true, protectedPos, mesh);
-        addEndpointSkin(world, endBlock, endTangent, lastFrame.radial, context.w,
-                false, protectedPos, mesh);
-    }
-
-    private static void addEndpointSkin(World world, BlockPos block, Vec3d pathTangent,
-                                        Vec3d radial, Vec3d widthAxis, boolean start,
-                                        Set<BlockPos> protectedPos, Map<BlockPos, MeshCell> mesh) {
-        Vec3d towardArc = start ? pathTangent : pathTangent.multiply(-1.0);
-        Direction connectionFace = dominantDirection(towardArc);
-        Vec3d center = blockCenter(block);
-        double reach = rayCubeDistance(towardArc);
-
-        for (Direction face : Direction.values()) {
-            if (face == connectionFace) continue;
-            Vec3d[] points = cubeFace(block, face);
-            float[] xyz = new float[12];
-            float[] uv = new float[8];
-            Vec3d faceNormal = directionVector(face);
-            double absT = Math.abs(faceNormal.dotProduct(pathTangent));
-            double absW = Math.abs(faceNormal.dotProduct(widthAxis));
-            double absN = Math.abs(faceNormal.dotProduct(radial));
-
-            for (int i = 0; i < 4; i++) {
-                Vec3d p = points[i].add(faceNormal.multiply(ENDPOINT_SKIN_OFFSET));
-                Vec3d rel = points[i].subtract(center);
-                double tangentCoordinate = rel.dotProduct(towardArc);
-                // Preserve texture direction across the endpoint/arc seam. The start endpoint reaches
-                // UV 1 at its connection edge and the arc begins at UV 0; the end arc reaches UV 1
-                // and the end endpoint begins at UV 0. 1->0 is the normal repeat wrap, not a mirror.
-                double pathPhase = start
-                        ? (tangentCoordinate + reach) / Math.max(1.0E-6, 2.0 * reach)
-                        : (reach - tangentCoordinate) / Math.max(1.0E-6, 2.0 * reach);
-                double w = rel.dotProduct(widthAxis) + 0.5;
-                double n = rel.dotProduct(radial) + 0.5;
-                double u, v;
-                if (absT >= absW && absT >= absN) {
-                    u = w;
-                    v = n;
-                } else if (absN >= absW) {
-                    u = pathPhase;
-                    v = w;
-                } else {
-                    u = pathPhase;
-                    v = n;
-                }
-                xyz[i * 3] = (float)p.x;
-                xyz[i * 3 + 1] = (float)p.y;
-                xyz[i * 3 + 2] = (float)p.z;
-                uv[i * 2] = clamp01((float)u);
-                uv[i * 2 + 1] = clamp01((float)v);
-            }
-            addSurface(world, xyz, uv, face, SourceProfile.MATERIAL_FULL, protectedPos, mesh);
+    private static int addModelCells(World world, BuildContext context, List<ArcPath.Sample> samples,
+                                     double totalLength, int tileCount, double laneOffset,
+                                     boolean collidable, Set<BlockPos> protectedPos,
+                                     Map<BlockPos, MeshCell> mesh,
+                                     Map<BlockPos, List<ArcAutoTrim.WorldPrism>> worldByCell) {
+        int added = 0;
+        double spacing = totalLength / tileCount;
+        for (int tile = 0; tile < tileCount; tile++) {
+            double s0 = tile * spacing;
+            double s1 = (tile + 1) * spacing;
+            Frame fa = frameAtDistance(context, samples, s0);
+            Frame fb = frameAtDistance(context, samples, s1);
+            float[] vertices = prism(fa.center, fb.center, fa.radial, fb.radial, context.w,
+                    laneOffset - 0.5, laneOffset + 0.5, -0.5, 0.5);
+            if (makePrism(world, vertices,
+                    0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f,
+                    SIDE_FACES, SourceProfile.MATERIAL_BAKED_MODEL, collidable,
+                    protectedPos, mesh, worldByCell) != null) added++;
         }
+        return added;
     }
 
     private static int addEndpointBridges(World world, BuildContext context, List<ArcPath.Sample> samples,
@@ -217,21 +191,23 @@ public final class ArcRibbonGenerator {
                 float[] vertices = prism(startInner, firstFrame.center,
                         firstFrame.radial, firstFrame.radial, context.w,
                         part.minW(), part.maxW(), part.minN(), part.maxN());
+                byte mask = part.materialHint() == SourceProfile.MATERIAL_COLLISION ? NO_FACES : SIDE_FACES;
                 if (makePrism(world, vertices,
                         textureCoord(profile.connectionReach + 0.5), 1.0f,
                         textureCoord(part.minW() + 0.5), textureCoordEnd(part.minW() + 0.5, part.maxW() + 0.5),
                         textureCoord(part.minN() + 0.5), textureCoordEnd(part.minN() + 0.5, part.maxN() + 0.5),
-                        SIDE_FACES, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
+                        mask, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
             }
             if (lastFrame.center.squaredDistanceTo(endInner) > 1.0E-6) {
                 float[] vertices = prism(lastFrame.center, endInner,
                         lastFrame.radial, lastFrame.radial, context.w,
                         part.minW(), part.maxW(), part.minN(), part.maxN());
+                byte mask = part.materialHint() == SourceProfile.MATERIAL_COLLISION ? NO_FACES : SIDE_FACES;
                 if (makePrism(world, vertices,
                         0.0f, textureCoord(0.5 - profile.connectionReach),
                         textureCoord(part.minW() + 0.5), textureCoordEnd(part.minW() + 0.5, part.maxW() + 0.5),
                         textureCoord(part.minN() + 0.5), textureCoordEnd(part.minN() + 0.5, part.maxN() + 0.5),
-                        SIDE_FACES, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
+                        mask, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
             }
         }
         return added;
@@ -246,6 +222,7 @@ public final class ArcRibbonGenerator {
                                          Set<BlockPos> protectedPos, Map<BlockPos, MeshCell> mesh,
                                          Map<BlockPos, List<ArcAutoTrim.WorldPrism>> worldByCell) {
         int added = 0;
+        byte mask = part.materialHint() == SourceProfile.MATERIAL_COLLISION ? NO_FACES : SIDE_FACES;
         for (int i = 0; i < samples.size() - 1; i++) {
             ArcPath.Sample a = samples.get(i), b = samples.get(i + 1);
             Frame fa = frame(context, a), fb = frame(context, b);
@@ -257,7 +234,7 @@ public final class ArcRibbonGenerator {
                     (float)tilePhase(mappedA), (float)phaseEnd(mappedA, mappedB),
                     textureCoord(part.minW() + 0.5), textureCoordEnd(part.minW() + 0.5, part.maxW() + 0.5),
                     textureCoord(part.minN() + 0.5), textureCoordEnd(part.minN() + 0.5, part.maxN() + 0.5),
-                    SIDE_FACES, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
+                    mask, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
         }
         return added;
     }
@@ -268,6 +245,7 @@ public final class ArcRibbonGenerator {
                                        Map<BlockPos, MeshCell> mesh,
                                        Map<BlockPos, List<ArcAutoTrim.WorldPrism>> worldByCell) {
         int added = 0;
+        byte mask = part.materialHint() == SourceProfile.MATERIAL_COLLISION ? NO_FACES : ALL_FACES;
         double spacing = totalLength / tileCount;
         for (int tile = 0; tile < tileCount; tile++) {
             double center = (tile + 0.5) * spacing;
@@ -282,7 +260,7 @@ public final class ArcRibbonGenerator {
                     textureCoord(part.minS() + 0.5), textureCoordEnd(part.minS() + 0.5, part.maxS() + 0.5),
                     textureCoord(part.minW() + 0.5), textureCoordEnd(part.minW() + 0.5, part.maxW() + 0.5),
                     textureCoord(part.minN() + 0.5), textureCoordEnd(part.minN() + 0.5, part.maxN() + 0.5),
-                    ALL_FACES, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
+                    mask, part.materialHint(), true, protectedPos, mesh, worldByCell) != null) added++;
         }
         return added;
     }
@@ -305,25 +283,8 @@ public final class ArcRibbonGenerator {
                 local, u0, u1, w0, w1, n0, n1,
                 faceMask, materialHint, collidable);
         mesh.computeIfAbsent(holder, key -> new MeshCell()).prisms.add(prism);
-        if (worldByCell != null) indexWorldPrism(worldVertices, worldByCell);
+        if (worldByCell != null && collidable) indexWorldPrism(worldVertices, worldByCell);
         return prism;
-    }
-
-    private static void addSurface(World world, float[] worldVertices, float[] uv,
-                                   Direction face, byte materialHint,
-                                   Set<BlockPos> protectedPos, Map<BlockPos, MeshCell> mesh) {
-        Box bounds = boundsOfQuad(worldVertices);
-        BlockPos holder = chooseExistingMeshHolder(bounds, mesh);
-        if (holder == null) holder = chooseHolder(world, bounds, protectedPos);
-        if (holder == null) return;
-        float[] local = new float[12];
-        for (int i = 0; i < 4; i++) {
-            local[i * 3] = worldVertices[i * 3] - holder.getX();
-            local[i * 3 + 1] = worldVertices[i * 3 + 1] - holder.getY();
-            local[i * 3 + 2] = worldVertices[i * 3 + 2] - holder.getZ();
-        }
-        mesh.computeIfAbsent(holder, key -> new MeshCell()).surfaces.add(
-                new ArcRibbonBlockEntity.SurfaceQuad(local, uv.clone(), (byte)face.ordinal(), materialHint));
     }
 
     private static BuildContext threePointContext(BlockPos startBlock, BlockPos controlBlock,
@@ -424,23 +385,6 @@ public final class ArcRibbonGenerator {
         return frame(context, interpolated);
     }
 
-
-    private static BlockPos chooseExistingMeshHolder(Box bounds, Map<BlockPos, MeshCell> mesh) {
-        if (mesh.isEmpty()) return null;
-        Vec3d center = bounds.getCenter();
-        BlockPos best = null;
-        double bestDistance = Double.POSITIVE_INFINITY;
-        for (BlockPos pos : mesh.keySet()) {
-            double distance = new Vec3d(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5)
-                    .squaredDistanceTo(center);
-            if (distance < bestDistance && distance <= 9.0) {
-                bestDistance = distance;
-                best = pos;
-            }
-        }
-        return best;
-    }
-
     private static BlockPos chooseHolder(World world, Box bounds, Set<BlockPos> protectedPos) {
         Vec3d center = bounds.getCenter();
         BlockPos primary = BlockPos.ofFloored(center);
@@ -497,43 +441,6 @@ public final class ArcRibbonGenerator {
         }
     }
 
-    private static Box boundsOfQuad(float[] xyz) {
-        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY, minZ = Double.POSITIVE_INFINITY;
-        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
-        for (int i = 0; i < 4; i++) {
-            minX = Math.min(minX, xyz[i * 3]); maxX = Math.max(maxX, xyz[i * 3]);
-            minY = Math.min(minY, xyz[i * 3 + 1]); maxY = Math.max(maxY, xyz[i * 3 + 1]);
-            minZ = Math.min(minZ, xyz[i * 3 + 2]); maxZ = Math.max(maxZ, xyz[i * 3 + 2]);
-        }
-        return new Box(minX, minY, minZ, maxX, maxY, maxZ);
-    }
-
-    private static Vec3d[] cubeFace(BlockPos block, Direction face) {
-        double x0 = block.getX(), x1 = x0 + 1.0;
-        double y0 = block.getY(), y1 = y0 + 1.0;
-        double z0 = block.getZ(), z1 = z0 + 1.0;
-        Vec3d[] vertices = switch (face) {
-            case DOWN -> new Vec3d[]{new Vec3d(x0,y0,z0), new Vec3d(x0,y0,z1), new Vec3d(x1,y0,z1), new Vec3d(x1,y0,z0)};
-            case UP -> new Vec3d[]{new Vec3d(x0,y1,z0), new Vec3d(x1,y1,z0), new Vec3d(x1,y1,z1), new Vec3d(x0,y1,z1)};
-            case NORTH -> new Vec3d[]{new Vec3d(x0,y0,z0), new Vec3d(x1,y0,z0), new Vec3d(x1,y1,z0), new Vec3d(x0,y1,z0)};
-            case SOUTH -> new Vec3d[]{new Vec3d(x0,y0,z1), new Vec3d(x0,y1,z1), new Vec3d(x1,y1,z1), new Vec3d(x1,y0,z1)};
-            case WEST -> new Vec3d[]{new Vec3d(x0,y0,z0), new Vec3d(x0,y1,z0), new Vec3d(x0,y1,z1), new Vec3d(x0,y0,z1)};
-            case EAST -> new Vec3d[]{new Vec3d(x1,y0,z0), new Vec3d(x1,y0,z1), new Vec3d(x1,y1,z1), new Vec3d(x1,y1,z0)};
-        };
-        Vec3d normal = vertices[1].subtract(vertices[0]).crossProduct(vertices[2].subtract(vertices[0])).normalize();
-        if (normal.dotProduct(directionVector(face)) < 0.0) {
-            Vec3d temp = vertices[1]; vertices[1] = vertices[3]; vertices[3] = temp;
-        }
-        return vertices;
-    }
-
-    private static Direction dominantDirection(Vec3d vector) {
-        double ax = Math.abs(vector.x), ay = Math.abs(vector.y), az = Math.abs(vector.z);
-        if (ay >= ax && ay >= az) return vector.y >= 0 ? Direction.UP : Direction.DOWN;
-        if (ax >= az) return vector.x >= 0 ? Direction.EAST : Direction.WEST;
-        return vector.z >= 0 ? Direction.SOUTH : Direction.NORTH;
-    }
-
     private static Vec3d directionVector(Direction direction) {
         return new Vec3d(direction.getOffsetX(), direction.getOffsetY(), direction.getOffsetZ());
     }
@@ -556,6 +463,5 @@ public final class ArcRibbonGenerator {
     }
     private static double lerp(double a, double b, double t) { return a + (b - a) * t; }
     private static double clamp(double value, double min, double max) { return Math.max(min, Math.min(max, value)); }
-    private static float clamp01(float value) { return Math.max(0.0f, Math.min(1.0f, value)); }
     private static Vec3d blockCenter(BlockPos p) { return new Vec3d(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5); }
 }

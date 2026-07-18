@@ -11,6 +11,7 @@ import net.minecraft.network.listener.ClientPlayPacketListener;
 import net.minecraft.network.packet.Packet;
 import net.minecraft.network.packet.s2c.play.BlockEntityUpdateS2CPacket;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.util.shape.VoxelShapes;
 
@@ -23,6 +24,9 @@ public final class ArcRibbonBlockEntity extends BlockEntity {
     private final List<Prism> prisms = new ArrayList<>();
     private final List<SurfaceQuad> surfaces = new ArrayList<>();
     private final List<CollisionBox> collisionBoxes = new ArrayList<>();
+    private byte modelMode = SourceProfile.MODEL_NONE;
+    /** Columns are source S, W and N axes in original model/world coordinates. */
+    private final float[] modelBasis = new float[]{1,0,0, 0,0,1, 0,1,0};
     private transient VoxelShape cachedShape;
     private transient int renderRevision;
 
@@ -33,10 +37,20 @@ public final class ArcRibbonBlockEntity extends BlockEntity {
     public BlockState getSourceState() { return sourceState; }
     public List<Prism> getPrisms() { return Collections.unmodifiableList(prisms); }
     public List<SurfaceQuad> getSurfaces() { return Collections.unmodifiableList(surfaces); }
+    public byte getModelMode() { return modelMode; }
+    public float[] getModelBasis() { return modelBasis.clone(); }
     public int getRenderRevision() { return renderRevision; }
 
     public void setData(BlockState sourceState, List<Prism> newPrisms, List<SurfaceQuad> newSurfaces) {
+        setData(sourceState, newPrisms, newSurfaces, SourceProfile.MODEL_NONE,
+                new Vec3d(1,0,0), new Vec3d(0,0,1), new Vec3d(0,1,0));
+    }
+
+    public void setData(BlockState sourceState, List<Prism> newPrisms, List<SurfaceQuad> newSurfaces,
+                        byte modelMode, Vec3d basisS, Vec3d basisW, Vec3d basisN) {
         this.sourceState = sourceState == null ? Blocks.STONE.getDefaultState() : sourceState;
+        this.modelMode = modelMode;
+        writeBasis(basisS, basisW, basisN);
         prisms.clear();
         prisms.addAll(newPrisms);
         surfaces.clear();
@@ -63,10 +77,25 @@ public final class ArcRibbonBlockEntity extends BlockEntity {
         return cachedShape;
     }
 
+    private void writeBasis(Vec3d s, Vec3d w, Vec3d n) {
+        Vec3d bs = safeNormal(s, new Vec3d(1,0,0));
+        Vec3d bw = safeNormal(w, new Vec3d(0,0,1));
+        Vec3d bn = safeNormal(n, new Vec3d(0,1,0));
+        modelBasis[0]=(float)bs.x; modelBasis[1]=(float)bs.y; modelBasis[2]=(float)bs.z;
+        modelBasis[3]=(float)bw.x; modelBasis[4]=(float)bw.y; modelBasis[5]=(float)bw.z;
+        modelBasis[6]=(float)bn.x; modelBasis[7]=(float)bn.y; modelBasis[8]=(float)bn.z;
+    }
+
+    private static Vec3d safeNormal(Vec3d value, Vec3d fallback) {
+        return value == null || value.lengthSquared() < 1.0E-9 ? fallback : value.normalize();
+    }
+
     @Override
     protected void writeNbt(NbtCompound nbt) {
         super.writeNbt(nbt);
         nbt.put("SourceState", MaterialStateCodec.write(sourceState));
+        nbt.putByte("ModelMode", modelMode);
+        for (int i=0;i<modelBasis.length;i++) nbt.putFloat("Basis"+i, modelBasis[i]);
 
         NbtList list = new NbtList();
         for (Prism p : prisms) {
@@ -107,6 +136,15 @@ public final class ArcRibbonBlockEntity extends BlockEntity {
     public void readNbt(NbtCompound nbt) {
         super.readNbt(nbt);
         sourceState = MaterialStateCodec.read(nbt.getCompound("SourceState"));
+        modelMode = nbt.contains("ModelMode", NbtElement.BYTE_TYPE)
+                ? nbt.getByte("ModelMode") : SourceProfile.MODEL_NONE;
+        if (nbt.contains("Basis0", NbtElement.FLOAT_TYPE)) {
+            for (int i=0;i<modelBasis.length;i++) modelBasis[i]=nbt.getFloat("Basis"+i);
+        } else {
+            float[] defaults={1,0,0, 0,0,1, 0,1,0};
+            System.arraycopy(defaults,0,modelBasis,0,defaults.length);
+        }
+
         prisms.clear();
         NbtList list = nbt.getList("Prisms", NbtElement.COMPOUND_TYPE);
         for (int i = 0; i < list.size(); i++) {
@@ -179,5 +217,6 @@ public final class ArcRibbonBlockEntity extends BlockEntity {
         }
     }
 
-    public record CollisionBox(float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {}
+    public record CollisionBox(float minX, float minY, float minZ,
+                               float maxX, float maxY, float maxZ) {}
 }
